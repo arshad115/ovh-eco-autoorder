@@ -46,7 +46,7 @@ This fork:
 
 ### Preferences file and a second process
 
-- A crash while saving leaves the previous `preferences.json` in place. The original code opens the file for writing, which truncates it first.
+- A crash while saving leaves the previous `preferences.json` in place. The original code opens the file for writing, which truncates it first. In Docker the file is bind-mounted and `/app` is not writable by the container user, so the save rewrites that mounted file instead of creating `preferences.json.tmp` beside it.
 - If `preferences.json` cannot be parsed, the process exits. It does not save an empty document over the real file.
 - The process holds `preferences.lock` until it exits. A second `order.py` refuses to start. Mount that file in Docker and run only one instance.
 - Availability polling and ordering use two OVH clients. Updates to `preferences.json` are serialized, so the catalog thread and the order loop do not save at the same time.

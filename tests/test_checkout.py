@@ -1,3 +1,4 @@
+import builtins
 import json
 import os
 import sys
@@ -162,6 +163,32 @@ class CheckoutTests(unittest.TestCase):
         self.assertIn("rejected", item["order_error"])
         self.assertEqual(order.place_order(client, item, {"dedicated_datacenter": "fra"}), "latched")
         self.assertEqual(len(client.posts), 1)
+
+    def test_save_rewrites_mounted_file_when_tmp_cannot_be_created(self):
+        from fetcher import atomic_write_text
+        with open("preferences.json", "w") as fh:
+            fh.write('{"old": 1}')
+        real_open = builtins.open
+        real_replace = os.replace
+
+        def guarded(file, mode="r", *args, **kwargs):
+            name = os.fspath(file)
+            if name.endswith("preferences.json.tmp") and "w" in str(mode):
+                raise PermissionError(13, "Permission denied")
+            return real_open(file, mode, *args, **kwargs)
+
+        def deny_replace(src, dst):
+            raise OSError("Device or resource busy")
+
+        try:
+            builtins.open = guarded
+            os.replace = deny_replace
+            atomic_write_text("preferences.json", '{"new": 2}')
+        finally:
+            builtins.open = real_open
+            os.replace = real_replace
+        with open("preferences.json") as fh:
+            self.assertEqual(fh.read(), '{"new": 2}')
 
     def test_invalid_preferences_are_not_overwritten(self):
         with open("preferences.json", "w") as fh:

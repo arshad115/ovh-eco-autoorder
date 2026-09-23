@@ -4,6 +4,7 @@ import urllib.request
 import urllib.error
 import errno
 import os
+import tempfile
 import time
 import json
 import datetime
@@ -20,28 +21,45 @@ try:
 except Exception:
     print("Error opening offers.json. However creating it.")
 
+def _rewrite_existing_file(path, text):
+    with open(path, "r+") as dest:
+        dest.seek(0)
+        dest.write(text)
+        dest.truncate()
+        dest.flush()
+        os.fsync(dest.fileno())
+
 def atomic_write_text(path, text):
+    # Docker bind-mounts the preferences file into /app and runs as uid 1000.
+    # Creating preferences.json.tmp in /app is denied, and renaming over the
+    # mount point fails, so fall back to rewriting the mounted file.
     tmp = path + ".tmp"
-    with open(tmp, "w") as ff:
-        ff.write(text)
-        ff.flush()
-        os.fsync(ff.fileno())
+    handle = None
+    try:
+        handle = open(tmp, "w")
+    except PermissionError:
+        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", dir=tempfile.gettempdir())
+        handle = os.fdopen(fd, "w")
+    try:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    finally:
+        handle.close()
     try:
         os.replace(tmp, path)
     except OSError:
-        # A bind-mounted file cannot be replaced. Rewrite the same inode.
-        with open(path, "r+") as dest:
-            dest.seek(0)
-            dest.write(text)
-            dest.truncate()
-            dest.flush()
-            os.fsync(dest.fileno())
+        _rewrite_existing_file(path, text)
         try:
             os.remove(tmp)
         except OSError:
             pass
         return
-    dirfd = os.open(".", os.O_RDONLY)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        dirfd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
     try:
         os.fsync(dirfd)
     except OSError:
