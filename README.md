@@ -95,7 +95,7 @@ A server contains a few important information
 > Keep in mind that if this set to false, the quantity set to 0 after the validation. So if you create an order and only validate it, to order it, close the APP, set quantity and restart it. This behaviour fixes the issue that multiple rechecks increases network load and time consumed by the script.
 - autopay: Controls that after the order, payment processed automaticaly or not
 > If you set this to false, until you do not pay the order it is not placed so you can lose your chance to get the server.
-- order_attempted: Fail-closed latch, default false. Immediately before checkout the script sets this to true, sets qty to 0, and saves `preferences.json`. If it is already true, another automatic checkout is refused. A failed or ambiguous checkout stays latched: check the OVH order manager, then set `order_attempted` back to false and `qty` back to 1 yourself before the script will try again.
+- order_attempted: Fail-closed latch, default false. Immediately before checkout the script sets this to true, records `order_attempted_in`, sets qty to 0, and saves `preferences.json`. Checkout runs only where OVH reports an orderable delivery window (`1H-high`, `1H-low`, `24H`, `72H`, and other `NH` values). `unknown`, `comingSoon`, and `unavailable` are skipped. If several datacenters are orderable, the shortest delivery is used, and only that one is submitted. If the latch is already true, another automatic checkout is refused. A failed or ambiguous checkout stays latched: check the OVH order manager, then set `order_attempted` back to false and `qty` back to 1 yourself before the script will try again. A second process exits if `preferences.lock` is already held.
 - coupons: An array which contains the coupon codes for the order
 - dc_carts: Empty, it stores the datacenter-specific cart informations. By default do not need manual modification.
 
@@ -113,7 +113,7 @@ Subsidiary: Depends on your API endpoint. Used at creating orders. You can fetch
 
 > This feature is very very experimental. Use it on your own risk!!!
 
-> This feature fetches the EU API catalog. In the future it will be compatible with CA and US.
+> This feature fetches the public eco catalog for the subsidiary in `preferences.json`. DE uses the EU API. CA and US use their own API hosts.
 
 > This feature consumes a high amount of data. Use it on your own risk!
 
@@ -178,7 +178,7 @@ python3 order.py
 
 Or in Docker (see packages).
 
-If you run it in Docker, bind the `preferences.json` to `/app` directory and bind the `.env` to the `/app` directory. Optionaly bind the `offers.json` if you want to access catalog from the host system.
+If you run it in Docker, bind the `preferences.json` and `preferences.lock` to `/app` and bind the `.env` to the `/app` directory. Optionaly bind the `offers.json` if you want to access catalog from the host system. Run only one instance. A second process exits while `preferences.lock` is held.
 
 ## Run it in Docker
 

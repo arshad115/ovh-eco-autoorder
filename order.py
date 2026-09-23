@@ -1,62 +1,128 @@
 #!/usr/bin/python3
 
 import json
-import time
-import ovh
 import os
-import dotenv
-from datetime import datetime, timedelta, timezone
-import urllib.request
+import re
+import sys
+import time
+import fcntl
 import logging
-from fetcher import fetch_catalog
 import threading
+from datetime import datetime, timezone
+from fetcher import atomic_write_text, fetch_catalog
 
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.DEBUG)
 
-denv = dotenv.load_dotenv("./.env")
+user_preferences = {}
+preferences_ready = False
+preferences_lock = threading.RLock()
+all_dc = []
+order_client = None
+availability_client = None
+instance_lock_handle = None
+ovh = None
 
-user_preferences={}
-try:
-    with open("preferences.json") as ff:
-        user_preferences = json.load(ff)
+# Shorter delivery wins. unknown, comingSoon, and unavailable are not orderable.
+_HOUR_DELAY = re.compile(r"^(\d+)H$")
+
+
+def availability_rank(status):
+    if status == "1H-high":
+        return 100000
+    if status == "1H-low":
+        return 90000
+    if not isinstance(status, str):
+        return None
+    match = _HOUR_DELAY.fullmatch(status)
+    if not match:
+        return None
+    hours = int(match.group(1))
+    if hours <= 0:
+        return None
+    return max(1, 10000 - hours)
+
+
+def load_preferences():
+    global user_preferences, preferences_ready
+    try:
+        with open("preferences.json") as ff:
+            loaded = json.load(ff)
+    except Exception:
+        logging.exception("Error opening preferences.json. Refusing to start so the file is not overwritten.")
+        sys.exit(1)
+    if not isinstance(loaded, dict) or "user_servers" not in loaded or "subsidiary" not in loaded:
+        logging.error("preferences.json must contain subsidiary and user_servers. Refusing to start.")
+        sys.exit(1)
+    user_preferences = loaded
+    preferences_ready = True
     logging.debug("Success opening preferences.json")
-except Exception as ex:
-    print("Error opening user preferences.")
+
 
 def save_preferences():
     global user_preferences
-    with open("preferences.json","w") as ff:
-        json.dump(user_preferences, ff, default=str,indent=2)
+    if not preferences_ready:
+        logging.error("Refusing to save preferences because they were not loaded.")
+        return
+    with preferences_lock:
+        text = json.dumps(user_preferences, default=str, indent=2)
+        atomic_write_text("preferences.json", text)
     logging.debug("Saved settings file.")
 
-client = ovh.Client()
+
+def acquire_instance_lock():
+    global instance_lock_handle
+    path = "preferences.lock"
+    try:
+        handle = open(path, "a+")
+    except PermissionError:
+        handle = open(path, "r")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logging.error("Another autoorder process holds preferences.lock. Refusing to start.")
+        sys.exit(1)
+    instance_lock_handle = handle
+    return handle
 
 
 def fetch_dcs():
-    global all_dc, client
+    global all_dc, availability_client
     while True:
         try:
-            all_dc = client.get("/dedicated/server/datacenter/availabilities", planCode="24skstor012-v1")
-            logging.debug("Fetched availabilities: "+str(len(all_dc)))
-        except Exception:
-            logging.debug("Datacenter fetching failed.")
+            with preferences_lock:
+                plan_codes = []
+                for server in user_preferences.get("user_servers", []):
+                    code = server.get("planCode")
+                    if code and code not in plan_codes:
+                        plan_codes.append(code)
+            merged = []
+            for code in plan_codes:
+                part = availability_client.get("/dedicated/server/datacenter/availabilities", planCode=code)
+                if isinstance(part, list):
+                    merged.extend(part)
+            all_dc = merged
+            logging.debug("Fetched availabilities: %s", len(all_dc))
+        except Exception as ex:
+            logging.warning("Datacenter fetching failed: %s", ex)
         time.sleep(3)
 
-def is_dc_available(all, desired, fqn):
-    logging.debug("Check availability for FQN "+fqn+" in "+desired)
-    for i in all:
-        if i["fqn"] == fqn:
-            logging.debug("FQN found in availabilities.")
-            for j in i["datacenters"]:
-                if j["datacenter"] == desired:
-                    logging.debug("Datacenter found with this FQN.")
-                    if j["availability"] == "unavailable":
-                        logging.debug("FQN not available in DC.")
-                        return False
-                    else:
-                        logging.debug("FQN available in this DC.")
-                        return True
-            return False
+
+def datacenter_status(all_avail, desired, fqn):
+    logging.debug("Check availability for FQN %s in %s", fqn, desired)
+    if not all_avail:
+        return None
+    for entry in all_avail:
+        if entry.get("fqn") != fqn:
+            continue
+        logging.debug("FQN found in availabilities.")
+        for dc in entry.get("datacenters", []):
+            if dc.get("datacenter") == desired:
+                status = dc.get("availability")
+                logging.debug("Datacenter %s availability is %s.", desired, status)
+                return status
+        return None
+    return None
+
 
 def next_cart_expiration_date():
     current_time = datetime.now()
@@ -169,6 +235,14 @@ def fill_cart(client, item, dc):
 def place_order(client, item, dc):
     logging.info("Running validation and order process (depend on your settings).")
     dedicated_datacenter=dc["dedicated_datacenter"]
+    if item.get("order_attempted", False):
+        logging.error(
+            "Checkout already attempted in %s. Refusing another automatic checkout.",
+            item.get("order_attempted_in"),
+        )
+        item["qty"] = 0
+        save_preferences()
+        return "latched"
     result={}
     if "skip_validate" not in item or item["skip_validate"] == False:
         logging.info("Validating the order. Check for cartId in your settings file "+item["dc_carts"][dedicated_datacenter]["cartId"]+" for more info")
@@ -177,31 +251,22 @@ def place_order(client, item, dc):
             result = client.get("/order/cart/"+item["dc_carts"][dedicated_datacenter]["cartId"]+"/summary")
         except Exception:
             logging.info("Can not fetch cart!")
-            return False
+            return "unavailable_cart"
         logging.info("Iterating cart...")
         for i in result["details"]:
             logging.info(i["description"]+" "+i["detailType"])
             logging.info(str(i["unitPrice"]["value"])+" "+i["unitPrice"]["currencyCode"])
         logging.info("Total: "+str(result["prices"]["withoutTax"]["value"])+" "+str(result["prices"]["withoutTax"]["currencyCode"]))
         item["dc_carts"][dedicated_datacenter]["raw_cart"] = result
-        if (result["prices"]["withoutTax"]["value"] >= item["ceiling_price"]):
-            logging.info("Too expensive! Drop order.")
-            item["ceiling_price"] = 0.0
-            item["qty"] = 0
-            return False
+        if (result["prices"]["withoutTax"]["value"] > item["ceiling_price"]):
+            logging.info("Too expensive in %s. Trying another datacenter if one is orderable.", dedicated_datacenter)
+            return "too_expensive"
     if "place_order" in item and item["place_order"] == True:
         logging.info("placing an order with this cart.")
-        if item.get("order_attempted", False):
-            logging.error(
-                "Checkout already attempted. Refusing another automatic checkout."
-            )
-            item["qty"] = 0
-            save_preferences()
-            return False
-
         # Persist the latch before POST so a crash after OVH accepts
         # cannot leave qty=1 and trigger a second autopay checkout.
         item["order_attempted"] = True
+        item["order_attempted_in"] = dedicated_datacenter
         item["qty"] = 0
         save_preferences()
 
@@ -213,96 +278,215 @@ def place_order(client, item, dc):
             )
             logging.info("Success! Order placed. Check the raw order in the cart for more info!")
         except ovh.exceptions.BadParametersError as ex:
-            item["order_error"] = ex
+            item["order_error"] = str(ex)
             logging.info(ex)
-            return False
+            save_preferences()
+            return "latched"
         except Exception as ex:
-            item["order_error"] = ex
+            item["order_error"] = str(ex)
             logging.info(ex)
-            return False
+            save_preferences()
+            return "latched"
         logging.debug("Setting additional vars.")
         item["ordered_at"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         item["ordered_in"]=dedicated_datacenter
         item["dc_carts"][dedicated_datacenter]["raw_order"] = order_result
         save_preferences()
+        return "ordered"
     else:
         item["qty"]-=item["qty"]
-    return True
+    return "validated"
+
+def cart_needs_rebuild(client, item, dedicated_datacenter):
+    cart = item["dc_carts"].get(dedicated_datacenter)
+    if not isinstance(cart, dict):
+        return True
+    item_ids = cart.get("itemIds")
+    if "cartId" not in cart or "cartExpire" not in cart or not item_ids:
+        return True
+    try:
+        if is_cart_expired(cart["cartExpire"]):
+            return True
+    except Exception:
+        logging.exception("Could not parse cart expiry for %s.", dedicated_datacenter)
+        return True
+    return not validate_cart(client, cart["cartId"], item_ids)
+
+def ensure_cart(client, item, dc):
+    dedicated_datacenter = dc["dedicated_datacenter"]
+    if not cart_needs_rebuild(client, item, dedicated_datacenter):
+        return True
+    try:
+        cart = init_cart(client)
+        item["dc_carts"][dedicated_datacenter] = {
+            "cartId": cart["cartId"],
+            "cartExpire": cart["expire"],
+        }
+        if not fill_cart(client, item, dc):
+            item["dc_carts"].pop(dedicated_datacenter, None)
+            return False
+        return True
+    except Exception:
+        logging.exception("Cart setup failed for %s.", dedicated_datacenter)
+        item["dc_carts"].pop(dedicated_datacenter, None)
+        return False
+
+def apply_catalog_addons(catalog):
+    if not isinstance(catalog, dict):
+        return
+    updated = False
+    for server in user_preferences.get("user_servers", []):
+        pending = server.get("fetch_catalog") or {}
+        if not pending:
+            continue
+        catalog_item = catalog.get(server.get("fqn"))
+        if not catalog_item or not catalog_item.get("catalog"):
+            logging.info("FQN %s not present in catalog yet.", server.get("fqn"))
+            continue
+        addons = catalog_item["catalog"].get("addons") or {}
+        additions = []
+        complete = True
+        for key, preset in pending.items():
+            if preset:
+                additions.append(preset)
+                continue
+            addon = addons.get(key)
+            if isinstance(addon, dict) and addon.get("planCode"):
+                additions.append(addon["planCode"])
+            elif isinstance(addon, dict) and addon.get("default"):
+                additions.append(addon["default"])
+            else:
+                complete = False
+        if not complete or not additions:
+            logging.info("Catalog for %s is still missing addon plan codes.", server.get("fqn"))
+            continue
+        server.setdefault("addon_planCodes", [])
+        server["addon_planCodes"].extend(additions)
+        server["fetch_catalog"] = {}
+        updated = True
+        logging.info("Filled addon plan codes for %s.", server.get("fqn"))
+    if updated:
+        save_preferences()
 
 def add_addons_to_servers():
-    global user_preferences, all_dc
-    catalog={}
+    global all_dc
     while True:
-        catalog={}
-        logging.debug("Iterate over catalog fetcher.")
-        for i in user_preferences["user_servers"]:
-            server=i
-            if "fetch_catalog" not in i or i["fetch_catalog"] == {}:
+        try:
+            snapshot = all_dc
+            if not snapshot:
+                time.sleep(3)
                 continue
-            if catalog == {}:
-                catalog = fetch_catalog(all_dc)
-                logging.debug("Downloading catalog and using the module to extract them.")
-            catalog_item = catalog.get(i["fqn"])
-
-            if not catalog_item:
-                logging.info("FQN %s not present in catalog yet.", i["fqn"])
+            with preferences_lock:
+                subsidiary = user_preferences["subsidiary"]
+                needs_catalog = any(
+                    (server.get("fetch_catalog") or {})
+                    for server in user_preferences.get("user_servers", [])
+                )
+            if not needs_catalog:
+                time.sleep(30)
                 continue
-
-            if catalog_item.get("catalog", {}) != {}:
-                logging.debug("Found catalog for "+i["fqn"])
-                catalog_cat = catalog[i["fqn"]]["catalog"]
-                for j in server["fetch_catalog"]:
-                    if server["fetch_catalog"][j] != "":
-                        server["addon_planCodes"].append(server["fetch_catalog"][j])
-                    else:
-                        if j in catalog_cat["addons"]:
-                            if "planCode" in catalog_cat["addons"][j]:
-                                server["addon_planCodes"].append(catalog_cat["addons"][j]["planCode"])
-                            else:
-                                server["addon_planCodes"].append(catalog_cat["addons"][j]["default"])
-                logging.debug("Make server catalog fetch empty. so do not fetch for this in next time.")
-                server["fetch_catalog"]={}
+            catalog = fetch_catalog(snapshot, subsidiary)
+            if catalog:
+                with preferences_lock:
+                    apply_catalog_addons(catalog)
+        except Exception:
+            logging.exception("Catalog fetcher failed.")
         time.sleep(30)
 
-def iterate_on():
-    global user_preferences, all_dc
-    for i in user_preferences["user_servers"]:
-        if i["qty"] < 1 or len(i["addon_planCodes"]) < 3:
+def orderable_candidates(availabilities, datacenters, fqn):
+    candidates = []
+    for index, dc in enumerate(datacenters):
+        name = dc["dedicated_datacenter"]
+        status = datacenter_status(availabilities, name, fqn)
+        rank = availability_rank(status)
+        if rank is None:
+            if status not in (None, "unavailable"):
+                logging.info(
+                    "Skipping %s in %s. Availability %s is not orderable.",
+                    fqn,
+                    name,
+                    status,
+                )
             continue
-        for j in i["datacenters"]:
-            dedicated_datacenter=j["dedicated_datacenter"]
-            if dedicated_datacenter not in i["dc_carts"] or "cartId" not in i["dc_carts"][dedicated_datacenter]  or "cartExpire" not in i["dc_carts"][dedicated_datacenter] or is_cart_expired(i["dc_carts"][dedicated_datacenter]["cartExpire"]) or not validate_cart(client, i["dc_carts"][dedicated_datacenter]["cartId"], i["dc_carts"][dedicated_datacenter]["itemIds"]):
-                cart = init_cart(client)
-                i["dc_carts"][dedicated_datacenter]={}
-                i["dc_carts"][dedicated_datacenter]["cartId"] = cart["cartId"]
-                i["dc_carts"][dedicated_datacenter]["cartExpire"] = cart["expire"]
-                if not fill_cart(client, i, j):
-                    del i["dc_carts"][dedicated_datacenter]
-                    continue
-                if i["qty"] >= 1 and len(i["addon_planCodes"]) >= 3 and is_dc_available(all_dc, dedicated_datacenter, i["fqn"]):
-                    place_order(client, i, j)
-            else:
-                if i["qty"] >= 1 and len(i["addon_planCodes"]) >= 3 and is_dc_available(all_dc, dedicated_datacenter, i["fqn"]):
-                    place_order(client, i, j)
+        candidates.append((rank, index, dc, status))
+    candidates.sort(key=lambda row: (-row[0], row[1]))
+    return candidates
 
-logging.info("Start thread: availability fetcher")
-dc_pull_thread = threading.Thread(target=fetch_dcs)
-dc_pull_thread.daemon = True  # Daemonize thread to exit when main program exits
-dc_pull_thread.start()
+def iterate_on():
+    global user_preferences, all_dc, order_client
+    availabilities = all_dc
+    for item in user_preferences["user_servers"]:
+        if item.get("qty", 0) < 1 or len(item.get("addon_planCodes", [])) < 3:
+            continue
+        if item.get("order_attempted", False):
+            logging.error(
+                "Checkout already attempted in %s. Refusing another automatic checkout.",
+                item.get("order_attempted_in"),
+            )
+            item["qty"] = 0
+            save_preferences()
+            continue
+        if not isinstance(item.get("dc_carts"), dict):
+            item["dc_carts"] = {}
+        ready = []
+        for dc in item["datacenters"]:
+            if ensure_cart(order_client, item, dc):
+                ready.append(dc)
+        candidates = [
+            row for row in orderable_candidates(availabilities, item["datacenters"], item["fqn"])
+            if row[2] in ready
+        ]
+        if not candidates:
+            continue
+        candidates.sort(key=lambda row: (-row[0], row[1]))
+        outcomes = []
+        for rank, index, dc, status in candidates:
+            logging.info(
+                "Selected %s for checkout. Availability %s.",
+                dc["dedicated_datacenter"],
+                status,
+            )
+            outcome = place_order(order_client, item, dc)
+            outcomes.append(outcome)
+            if outcome in ("ordered", "latched", "validated"):
+                break
+        if outcomes and all(outcome == "too_expensive" for outcome in outcomes):
+            logging.info("Every orderable datacenter is over the ceiling. Dropping the server.")
+            item["ceiling_price"] = 0.0
+            item["qty"] = 0
 
-time.sleep(3)
-logging.info("Start thread: catalog fetcher")
-catalog_pull_thread = threading.Thread(target=add_addons_to_servers)
-catalog_pull_thread.daemon = True  # Daemonize thread to exit when main program exits
-catalog_pull_thread.start()
+def main():
+    global ovh, order_client, availability_client
+    import ovh as ovh_sdk
+    import dotenv
+    ovh = ovh_sdk
+    dotenv.load_dotenv("./.env")
+    load_preferences()
+    acquire_instance_lock()
+    order_client = ovh.Client()
+    availability_client = ovh.Client()
 
-while True:
-    logging.info("New round.")
-    try:
-        iterate_on()
-    except Exception as ex:
-        print(ex)
-        pass
-        
-    save_preferences()
+    logging.info("Start thread: availability fetcher")
+    dc_pull_thread = threading.Thread(target=fetch_dcs)
+    dc_pull_thread.daemon = True
+    dc_pull_thread.start()
+
     time.sleep(3)
+    logging.info("Start thread: catalog fetcher")
+    catalog_pull_thread = threading.Thread(target=add_addons_to_servers)
+    catalog_pull_thread.daemon = True
+    catalog_pull_thread.start()
+
+    while True:
+        logging.info("New round.")
+        try:
+            with preferences_lock:
+                iterate_on()
+        except Exception:
+            logging.exception("Order round failed.")
+        with preferences_lock:
+            save_preferences()
+        time.sleep(3)
+
+if __name__ == "__main__":
+    main()

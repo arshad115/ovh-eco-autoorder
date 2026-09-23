@@ -3,6 +3,7 @@
 import urllib.request
 import urllib.error
 import errno
+import os
 import time
 import json
 import datetime
@@ -19,10 +20,47 @@ try:
 except Exception:
     print("Error opening offers.json. However creating it.")
 
+def atomic_write_text(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as ff:
+        ff.write(text)
+        ff.flush()
+        os.fsync(ff.fileno())
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        # A bind-mounted file cannot be replaced. Rewrite the same inode.
+        with open(path, "r+") as dest:
+            dest.seek(0)
+            dest.write(text)
+            dest.truncate()
+            dest.flush()
+            os.fsync(dest.fileno())
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return
+    dirfd = os.open(".", os.O_RDONLY)
+    try:
+        os.fsync(dirfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dirfd)
+
 def save_file():
     global offers
-    with open("offers.json","w") as ff:
-        json.dump(offers, ff, default=str,indent=2)
+    atomic_write_text("offers.json", json.dumps(offers, default=str, indent=2))
+
+def pricing_major(pricings):
+    if not pricings:
+        return 0.0
+    chosen = pricings[1] if len(pricings) > 1 else pricings[0]
+    try:
+        return chosen["price"] / 100000000
+    except (KeyError, TypeError, IndexError):
+        return 0.0
 
 def search_addon(planCode):
     global server_availabilities, server_catalog
@@ -31,7 +69,7 @@ def search_addon(planCode):
         if planCode == addon['planCode']:
             data['planCode']=addon["planCode"]
             data['invoiceName']=addon["invoiceName"]
-            data['price']=(addon["pricings"][1]["price"]/100000000)
+            data['price']=pricing_major(addon.get("pricings"))
             return data
     return "unknown"
 
@@ -59,24 +97,30 @@ def get_addons(addonFamilies, memory_code, storage_code):
         if "mandatory" in i and i["mandatory"] == True:
             if name == "storage":
                 in_list=i["addons"]
+                out_list=[]
                 if len(in_list) > 1:
                     r = re.compile(storage_code+".*")
                     out_list=list(filter(r.match, in_list))
                 elif len(in_list) == 1:
                     out_list = [in_list[0]]
                 if len(out_list) > 0:
-                    ret_addons["storage"]=search_addon(out_list[0])
-                    ret_addons["price"]+=ret_addons["storage"]["price"]
+                    found=search_addon(out_list[0])
+                    if isinstance(found, dict):
+                        ret_addons["storage"]=found
+                        ret_addons["price"]+=found.get("price", 0.0)
             elif name == "memory":
                 in_list=i["addons"]
+                out_list=[]
                 if len(in_list) > 1:
                     r = re.compile(memory_code+".*")
                     out_list=list(filter(r.match, in_list))
                 elif len(in_list) == 1:
                     out_list = [in_list[0]]
                 if len(out_list) > 0:
-                    ret_addons["memory"]=search_addon(out_list[0])
-                    ret_addons["price"]+=ret_addons["memory"]["price"]
+                    found=search_addon(out_list[0])
+                    if isinstance(found, dict):
+                        ret_addons["memory"]=found
+                        ret_addons["price"]+=found.get("price", 0.0)
             else:
                 ret_addons[name]={}
                 ret_addons[name]["mandatory"]=i["mandatory"]
@@ -115,7 +159,7 @@ def search_server(planCode, memory_code, storage_code):
                 server["range"]=product["blobs"]["commercial"]["range"]
             else:
                 server["range"]=get_range(planCode)
-            server['price']=(product['pricings'][1]['price']/100000000)
+            server['price']=pricing_major(product.get("pricings"))
             server["sum_price"]+=server['price']
             server['planCode']=product['planCode']
             server["cpu"]=search_cpu(product['planCode'], server['invoiceName'])
@@ -124,13 +168,23 @@ def search_server(planCode, memory_code, storage_code):
             server["sum_price"]+=server["addons"]["price"]
     return server
 
-def fetch_offers_and_servers():
+def catalog_url(subsidiary):
+    sub = (subsidiary or "").upper()
+    if sub in {"CA", "QC", "WE", "WS"}:
+        host = "https://ca.api.ovh.com/v1"
+    elif sub == "US":
+        host = "https://api.us.ovhcloud.com/v1"
+    else:
+        host = "https://eu.api.ovh.com/v1"
+    return host + "/order/catalog/public/eco?ovhSubsidiary=" + sub
+
+def fetch_offers_and_servers(subsidiary):
     global server_availabilities, server_catalog
     headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0'}
     try:
         req = urllib.request.Request(
-            url="https://www.ovh.ie/engine/apiv6/order/catalog/public/eco?ovhSubsidiary=IE", 
-            data=None, 
+            url=catalog_url(subsidiary),
+            data=None,
             headers=headers
         )
         with urllib.request.urlopen(req,timeout=10) as response:
@@ -138,7 +192,7 @@ def fetch_offers_and_servers():
     except Exception as e:
         print("error in fetch")
         print(e)
-        pass
+        return False
     return True
 
 def iterate_availabilities(server_availabilities):
@@ -155,8 +209,9 @@ def iterate_availabilities(server_availabilities):
         offers[fqn]["storage"]=storage_code
         offers[fqn]["catalog"]=search_server(planCode, memory_code, storage_code)
 
-def fetch_catalog(availabilities):
-    fetch_offers_and_servers()
+def fetch_catalog(availabilities, subsidiary):
+    if not fetch_offers_and_servers(subsidiary):
+        return None
     iterate_availabilities(availabilities)
     save_file()
     return offers
