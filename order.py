@@ -22,24 +22,22 @@ availability_client = None
 instance_lock_handle = None
 ovh = None
 
-# Shorter delivery wins. unknown, comingSoon, and unavailable are not orderable.
+# unknown, comingSoon, and unavailable are not orderable.
+# Datacenter array order is the preference. Delivery time is only a maximum.
 _HOUR_DELAY = re.compile(r"^(\d+)H$")
+DEFAULT_MAX_DELIVERY_HOURS = 72
 
 
-def availability_rank(status):
-    if status == "1H-high":
-        return 100000
-    if status == "1H-low":
-        return 90000
-    if not isinstance(status, str):
-        return None
-    match = _HOUR_DELAY.fullmatch(status)
-    if not match:
-        return None
-    hours = int(match.group(1))
-    if hours <= 0:
-        return None
-    return max(1, 10000 - hours)
+def availability_hours(status):
+    if status in ("1H-high", "1H-low"):
+        return 1
+    if isinstance(status, str):
+        match = _HOUR_DELAY.fullmatch(status)
+        if match:
+            hours = int(match.group(1))
+            if hours > 0:
+                return hours
+    return None
 
 
 def load_preferences():
@@ -170,12 +168,11 @@ def validate_cart(client, cartId, item_ids):
     return True
 
 def is_cart_expired(expiration):
-    exp_date = datetime.fromisoformat(expiration)
-    current_time = datetime.utcnow()
-    difference_seconds = exp_date.timestamp()-current_time.timestamp()
-    if difference_seconds <= 120:
-        return True
-    return False
+    exp_date = datetime.fromisoformat(str(expiration).replace("Z", "+00:00"))
+    if exp_date.tzinfo is None:
+        exp_date = exp_date.replace(tzinfo=timezone.utc)
+    difference_seconds = (exp_date - datetime.now(timezone.utc)).total_seconds()
+    return difference_seconds <= 120
 
 def fill_cart(client, item, dc):
     result = None
@@ -336,6 +333,11 @@ def apply_catalog_addons(catalog):
         return
     updated = False
     for server in user_preferences.get("user_servers", []):
+        if len(server.get("addon_planCodes") or []) >= 3:
+            if server.get("fetch_catalog"):
+                server["fetch_catalog"] = {}
+                updated = True
+            continue
         pending = server.get("fetch_catalog") or {}
         if not pending:
             continue
@@ -368,22 +370,49 @@ def apply_catalog_addons(catalog):
     if updated:
         save_preferences()
 
+def availability_record_from_server(server):
+    fqn = server.get("fqn") or ""
+    parts = fqn.split(".")
+    plan = server.get("planCode")
+    if not plan or len(parts) < 3:
+        return None
+    return {
+        "planCode": plan,
+        "fqn": fqn,
+        "memory": parts[1],
+        "storage": parts[-1],
+    }
+
+def servers_needing_catalog(servers):
+    needed = []
+    for server in servers:
+        if len(server.get("addon_planCodes") or []) >= 3:
+            continue
+        if not (server.get("fetch_catalog") or {}):
+            continue
+        needed.append(server)
+    return needed
+
 def add_addons_to_servers():
     global all_dc
     while True:
         try:
-            snapshot = all_dc
-            if not snapshot:
-                time.sleep(3)
-                continue
             with preferences_lock:
                 subsidiary = user_preferences["subsidiary"]
-                needs_catalog = any(
-                    (server.get("fetch_catalog") or {})
-                    for server in user_preferences.get("user_servers", [])
-                )
-            if not needs_catalog:
+                servers = user_preferences.get("user_servers", [])
+                needed = servers_needing_catalog(servers)
+                snapshot = list(all_dc)
+                if not snapshot:
+                    snapshot = []
+                    for server in needed:
+                        record = availability_record_from_server(server)
+                        if record:
+                            snapshot.append(record)
+            if not needed:
                 time.sleep(30)
+                continue
+            if not snapshot:
+                time.sleep(3)
                 continue
             catalog = fetch_catalog(snapshot, subsidiary)
             if catalog:
@@ -393,13 +422,17 @@ def add_addons_to_servers():
             logging.exception("Catalog fetcher failed.")
         time.sleep(30)
 
-def orderable_candidates(availabilities, datacenters, fqn):
+def orderable_candidates(availabilities, datacenters, fqn, max_hours=DEFAULT_MAX_DELIVERY_HOURS):
     candidates = []
+    try:
+        max_hours = float(max_hours)
+    except (TypeError, ValueError):
+        max_hours = DEFAULT_MAX_DELIVERY_HOURS
     for index, dc in enumerate(datacenters):
         name = dc["dedicated_datacenter"]
         status = datacenter_status(availabilities, name, fqn)
-        rank = availability_rank(status)
-        if rank is None:
+        hours = availability_hours(status)
+        if hours is None:
             if status not in (None, "unavailable"):
                 logging.info(
                     "Skipping %s in %s. Availability %s is not orderable.",
@@ -408,8 +441,16 @@ def orderable_candidates(availabilities, datacenters, fqn):
                     status,
                 )
             continue
-        candidates.append((rank, index, dc, status))
-    candidates.sort(key=lambda row: (-row[0], row[1]))
+        if hours > max_hours:
+            logging.info(
+                "Skipping %s in %s: delivery %s exceeds max %sh.",
+                fqn,
+                name,
+                status,
+                max_hours,
+            )
+            continue
+        candidates.append((hours, index, dc, status))
     return candidates
 
 def iterate_on():
@@ -428,19 +469,22 @@ def iterate_on():
             continue
         if not isinstance(item.get("dc_carts"), dict):
             item["dc_carts"] = {}
-        ready = []
-        for dc in item["datacenters"]:
-            if ensure_cart(order_client, item, dc):
-                ready.append(dc)
-        candidates = [
-            row for row in orderable_candidates(availabilities, item["datacenters"], item["fqn"])
-            if row[2] in ready
-        ]
+        candidates = orderable_candidates(
+            availabilities,
+            item["datacenters"],
+            item["fqn"],
+            item.get("max_delivery_hours", DEFAULT_MAX_DELIVERY_HOURS),
+        )
         if not candidates:
             continue
-        candidates.sort(key=lambda row: (-row[0], row[1]))
+        ready_candidates = []
+        for hours, index, dc, status in candidates:
+            if ensure_cart(order_client, item, dc):
+                ready_candidates.append((hours, index, dc, status))
+        if not ready_candidates:
+            continue
         outcomes = []
-        for rank, index, dc, status in candidates:
+        for hours, index, dc, status in ready_candidates:
             logging.info(
                 "Selected %s for checkout. Availability %s.",
                 dc["dedicated_datacenter"],

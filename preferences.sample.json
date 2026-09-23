@@ -9,11 +9,8 @@
       "autopay": true,
       "order_attempted": false,
       "coupons": [],
-      "fetch_catalog": {
-        "storage": "",
-        "memory": "",
-        "bandwidth": ""
-      },
+      "max_delivery_hours": 72,
+      "fetch_catalog": {},
       "datacenters": [
         {
           "region": "europe",
@@ -39,7 +36,11 @@
       "labels": {
         "dedicated_os": "none_64.en"
       },
-      "addon_planCodes": [],
+      "addon_planCodes": [
+        "ram-16g-24skstor01",
+        "hybridsoftraid-4x4000sa-1x500nvme-24skstor",
+        "bandwidth-500-24sk"
+      ],
       "qty": 1,
       "ceiling_price": 52.0,
       "dc_carts": {}
