@@ -36,7 +36,7 @@ def fetch_dcs():
     global all_dc, client
     while True:
         try:
-            all_dc = client.get("/dedicated/server/datacenter/availabilities")
+            all_dc = client.get("/dedicated/server/datacenter/availabilities", planCode="24skstor012-v1")
             logging.debug("Fetched availabilities: "+str(len(all_dc)))
         except Exception:
             logging.debug("Datacenter fetching failed.")
@@ -125,7 +125,7 @@ def fill_cart(client, item, dc):
         )
         logging.debug("Server planCode placement ok "+item["planCode"])
     except ovh.exceptions.BadParametersError as ex:
-        logging.info("Bad parameter when placing server planCode "+item["planCode"])
+        logging.info("Bad parameter when placing server planCode %s: %s ",item["planCode"],ex,)
         return False
     itemId=result["itemId"]
     server_itemId = result["itemId"]
@@ -228,7 +228,13 @@ def add_addons_to_servers():
             if catalog == {}:
                 catalog = fetch_catalog(all_dc)
                 logging.debug("Downloading catalog and using the module to extract them.")
-            if catalog[i["fqn"]]["catalog"] != {}:
+            catalog_item = catalog.get(i["fqn"])
+
+            if not catalog_item:
+                logging.info("FQN %s not present in catalog yet.", i["fqn"])
+                continue
+
+            if catalog_item.get("catalog", {}) != {}:
                 logging.debug("Found catalog for "+i["fqn"])
                 catalog_cat = catalog[i["fqn"]]["catalog"]
                 for j in server["fetch_catalog"]:
@@ -256,7 +262,9 @@ def iterate_on():
                 i["dc_carts"][dedicated_datacenter]={}
                 i["dc_carts"][dedicated_datacenter]["cartId"] = cart["cartId"]
                 i["dc_carts"][dedicated_datacenter]["cartExpire"] = cart["expire"]
-                fill_cart(client, i, j)
+                if not fill_cart(client, i, j):
+                    del i["dc_carts"][dedicated_datacenter]
+                    continue
                 if i["qty"] >= 1 and len(i["addon_planCodes"]) >= 3 and is_dc_available(all_dc, dedicated_datacenter, i["fqn"]):
                     place_order(client, i, j)
             else:
