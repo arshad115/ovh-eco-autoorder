@@ -209,7 +209,7 @@ class CheckoutTests(unittest.TestCase):
         order.all_dc = avail(item["fqn"], {"fra": "24H", "sbg": "1H-low", "gra": "unavailable"})
         order.order_client = FakeClient()
         order.iterate_on()
-        self.assertEqual(built, ["fra", "sbg"])
+        self.assertEqual(built, ["fra"])
         self.assertEqual(order.order_client.posts, ["/order/cart/fra/checkout"])
         self.assertEqual(item["ordered_in"], "fra")
 

@@ -477,14 +477,10 @@ def iterate_on():
         )
         if not candidates:
             continue
-        ready_candidates = []
-        for hours, index, dc, status in candidates:
-            if ensure_cart(order_client, item, dc):
-                ready_candidates.append((hours, index, dc, status))
-        if not ready_candidates:
-            continue
         outcomes = []
-        for hours, index, dc, status in ready_candidates:
+        for hours, index, dc, status in candidates:
+            if not ensure_cart(order_client, item, dc):
+                continue
             logging.info(
                 "Selected %s for checkout. Availability %s.",
                 dc["dedicated_datacenter"],

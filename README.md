@@ -12,9 +12,71 @@ In this program you can place orders VIA the OVHcloud API and start it as a scri
 
 > As this script fetches the OVHcloud server availability API and if required, the catalog API, requires a higher amount of data.
 
+## What this fork changes
+
+This repository is a fork of [adns44/ovh-eco-autoorder](https://github.com/adns44/ovh-eco-autoorder). The OVH cart and checkout calls are the same. The changes are there so an unattended bot with autopay makes one purchase and then stops.
+
+The original project was exercised on subsidiary IE. The sample in this fork is KS-STOR on subsidiary DE. Copy `preferences.sample.json` to `preferences.json` and edit it.
+
+### One checkout
+
+Upstream sets `qty` to 0 only after OVH accepts the checkout, and `preferences.json` is written later by the main loop. If the process dies in that gap, the next start still has `qty` 1 and can buy a second server.
+
+This fork saves a latch before `POST /checkout`:
+
+1. The first invoice, excluding VAT, is compared with `ceiling_price`. A total equal to the ceiling is allowed. A higher total tries the next preferred datacenter. If every orderable datacenter is over the ceiling, `qty` and `ceiling_price` are set to 0 and nothing is bought.
+2. `order_attempted` is set to true, `order_attempted_in` records the datacenter, and `qty` is set to 0.
+3. `preferences.json` is written to a temporary file, fsynced, and then moved into place.
+4. The checkout POST runs, with `waiveRetractationPeriod` left false.
+5. A successful response stores `ordered_at`, `ordered_in`, and the raw order, then saves again. A failed, rejected, or timed-out checkout stays latched.
+
+Check the OVH order manager before you try again. Set `order_attempted` back to false and `qty` back to 1 yourself. The script will not do that.
+
+### Which datacenter it buys
+
+Upstream treats every availability value other than `unavailable` as in stock. That includes `unknown`, `comingSoon`, and long delays such as `240H`, `480H`, `720H`, `1440H`, and `2160H`. It also creates a cart for every configured datacenter before it asks whether any of them can be ordered, then checks out the first site in the list that is not `unavailable`.
+
+This fork:
+
+- Requests `/dedicated/server/datacenter/availabilities` for each `planCode` in `preferences.json`.
+- Treats `1H-high` and `1H-low` as 1 hour. Other orderable values are delivery windows such as `24H` and `72H`.
+- Skips `unavailable`, `unknown`, `comingSoon`, and any window longer than `max_delivery_hours` (default 72). Set that to 24 if you only want near-immediate stock.
+- Uses the `datacenters` array as preference order. With FRA first, FRA is bought whenever FRA is within the cap, even when a later site is `1H-low`. The next site is used when the earlier one is outside the cap, over the ceiling, or its cart cannot be created.
+- Creates a cart for the first preferred datacenter that passed that filter, then checks the price and checks out. The next datacenter is prepared only if that cart fails or the price is over the ceiling.
+
+### Preferences file and a second process
+
+- A crash while saving leaves the previous `preferences.json` in place. The original code opens the file for writing, which truncates it first.
+- If `preferences.json` cannot be parsed, the process exits. It does not save an empty document over the real file.
+- The process holds `preferences.lock` until it exits. A second `order.py` refuses to start. Mount that file in Docker and run only one instance.
+- Availability polling and ordering use two OVH clients. Updates to `preferences.json` are serialized, so the catalog thread and the order loop do not save at the same time.
+- Cart expiry is compared in UTC. The original comparison used `datetime.utcnow()` against an offset-aware OVH timestamp.
+
+### Catalog
+
+Upstream downloads the public eco catalog with `ovhSubsidiary=IE`.
+
+This fork uses the `subsidiary` in `preferences.json`. DE uses the EU API. CA and US use their own API hosts.
+
+`preferences.sample.json` already contains the KS-STOR add-on plan codes, so ordering does not wait for a catalog download:
+
+- `ram-16g-24skstor01`
+- `hybridsoftraid-4x4000sa-1x500nvme-24skstor`
+- `bandwidth-500-24sk`
+
+Leave `fetch_catalog` empty when those codes are filled in. If `fetch_catalog` is set and fewer than three add-on codes are present, the catalog thread can resolve them from the FQN even while the availability feed is empty. It does not append more codes once three are already stored. An error in that thread is logged and the loop continues. A cart entry that is missing `itemIds` is rebuilt instead of aborting the round.
+
+### Tests
+
+```
+python3 -m unittest tests/test_checkout.py
+```
+
+The tests cover the latch, the ceiling, long delivery, Frankfurt-first selection, a failed checkout, a preferences file that cannot be parsed, a missing catalog, and a failed cart.
+
 ## Set it up
 
-Tested on subsidiary IE, probably work on others but it does not tested.
+The original project was tested on subsidiary IE. This fork's sample config uses subsidiary DE.
 Project based on [OVHcloud Python wrapper](https://github.com/ovh/python-ovh), consult with this about subsidiary settings and more.
 
 ### Set up the API
@@ -48,6 +110,8 @@ Here is an example JSON contents for it.
       "skip_validate": false,
       "place_order": false,
       "autopay": false,
+      "max_delivery_hours": 72,
+      "order_attempted": false,
       "coupons": ["MONDAY"],
       "datacenters": [
         {
@@ -135,6 +199,8 @@ Here is the raw JSON for this. You can combine multiple servers with multiple op
       "skip_validate": false,
       "place_order": false,
       "autopay": false,
+      "max_delivery_hours": 72,
+      "order_attempted": false,
       "coupons": ["MONDAY"],
       "fetch_catalog": {
         "storage": "",
