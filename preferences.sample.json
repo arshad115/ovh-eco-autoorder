@@ -1,0 +1,48 @@
+{
+  "subsidiary": "DE",
+  "user_servers": [
+    {
+      "planCode": "24skstor012-v1",
+      "fqn": "24skstor012-v1.ram-16g-ecc-2133.hybridsoftraid-4x4000sa-1x500nvme",
+      "skip_validate": false,
+      "place_order": true,
+      "autopay": true,
+      "order_attempted": false,
+      "coupons": [],
+      "fetch_catalog": {
+        "storage": "",
+        "memory": "",
+        "bandwidth": ""
+      },
+      "datacenters": [
+        {
+          "region": "europe",
+          "dedicated_datacenter": "fra"
+        },
+        {
+          "region": "europe",
+          "dedicated_datacenter": "sbg"
+        },
+        {
+          "region": "europe",
+          "dedicated_datacenter": "gra"
+        },
+        {
+          "region": "europe",
+          "dedicated_datacenter": "rbx"
+        },
+        {
+          "region": "europe",
+          "dedicated_datacenter": "waw"
+        }
+      ],
+      "labels": {
+        "dedicated_os": "none_64.en"
+      },
+      "addon_planCodes": [],
+      "qty": 1,
+      "ceiling_price": 52.0,
+      "dc_carts": {}
+    }
+  ]
+}

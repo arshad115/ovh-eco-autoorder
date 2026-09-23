@@ -34,6 +34,7 @@ OVH_CONSUMER_KEY='XXX'
 ### Set up your desired orders
 
 you need to create the `preferences.json` file.
+`preferences.sample.json` is a ready-to-copy config (KS-STOR, subsidiary DE). Copy it to `preferences.json` and edit it.
 Here is an example JSON contents for it.
 
 #### RAW JSON
@@ -94,6 +95,7 @@ A server contains a few important information
 > Keep in mind that if this set to false, the quantity set to 0 after the validation. So if you create an order and only validate it, to order it, close the APP, set quantity and restart it. This behaviour fixes the issue that multiple rechecks increases network load and time consumed by the script.
 - autopay: Controls that after the order, payment processed automaticaly or not
 > If you set this to false, until you do not pay the order it is not placed so you can lose your chance to get the server.
+- order_attempted: Fail-closed latch, default false. Immediately before checkout the script sets this to true, sets qty to 0, and saves `preferences.json`. If it is already true, another automatic checkout is refused. A failed or ambiguous checkout stays latched: check the OVH order manager, then set `order_attempted` back to false and `qty` back to 1 yourself before the script will try again.
 - coupons: An array which contains the coupon codes for the order
 - dc_carts: Empty, it stores the datacenter-specific cart informations. By default do not need manual modification.
 

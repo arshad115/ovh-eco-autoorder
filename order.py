@@ -191,6 +191,20 @@ def place_order(client, item, dc):
             return False
     if "place_order" in item and item["place_order"] == True:
         logging.info("placing an order with this cart.")
+        if item.get("order_attempted", False):
+            logging.error(
+                "Checkout already attempted. Refusing another automatic checkout."
+            )
+            item["qty"] = 0
+            save_preferences()
+            return False
+
+        # Persist the latch before POST so a crash after OVH accepts
+        # cannot leave qty=1 and trigger a second autopay checkout.
+        item["order_attempted"] = True
+        item["qty"] = 0
+        save_preferences()
+
         order_result={}
         try:
             order_result = client.post("/order/cart/"+item["dc_carts"][dedicated_datacenter]["cartId"]+"/checkout",
@@ -207,10 +221,10 @@ def place_order(client, item, dc):
             logging.info(ex)
             return False
         logging.debug("Setting additional vars.")
-        item["qty"]-=item["qty"]
         item["ordered_at"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         item["ordered_in"]=dedicated_datacenter
         item["dc_carts"][dedicated_datacenter]["raw_order"] = order_result
+        save_preferences()
     else:
         item["qty"]-=item["qty"]
     return True
